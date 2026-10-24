@@ -1,49 +1,78 @@
-# DFS & BFS
+# SimpleLogger
 
-A small C++23 demo of binary tree traversal algorithms.
+A small, header-only C++23 thread-safe logger with a streaming API, severity levels, pluggable line prefixes and pluggable output destinations (sinks).
 
 ## What it shows
 
-| Traversal | Variant | Data structure |
+| Feature | API | Mechanism |
 |---|---|---|
-| DFS preorder | Recursive (`DfsR`) | Call stack |
-| DFS postorder | Recursive (`DfsR`) | Call stack |
-| DFS preorder | Iterative (`Dfs`) | `std::stack` |
-| DFS postorder | Iterative (`Dfs`) | `std::stack` |
-| BFS (level order) | Iterative (`Bfs`) | `std::queue` |
+| Streaming log line | `LOG(DEBUG) << ...` | `SimpleLogger` temporary, one per line |
+| Severity levels | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | `SimpleLogger::Severity` enum |
+| Output destination | `SetSink` | `std::shared_ptr<Sink>` (abstract interface) |
+| Output stream shortcut | `SetOstream` | Wraps a `std::wostream` in an `OStreamSink` |
+| Line prefixes | `SetPrefixList` | `std::function<std::wstring()>` list |
+| Atomic lines | Per-line buffering, one `Write()` per line | `std::wostringstream` + sink-side locking |
+| Shared configuration | Static state guarded by a lock | `std::shared_mutex` |
 
-The demo builds this tree and prints the visit order of each traversal:
+The logger formats a line; a `Sink` decides where and when it is written. `Sink.hpp` defines the interface and `OStreamSink`, an adapter for any `std::wostream`. Other destinations (file, debugger, network) and behaviors (async, fan-out) are meant to be additional `Sink` implementations or decorators.
 
-```text
-        1
-       / \
-      2   4
-     /     \
-    3       5
+The demo opens `SimpleLogger.log` in append mode, installs a UTC timestamp prefix and logs a few lines:
+
+```cpp
+SimpleLogger::SetOstream(std::move(out_stream));
+SimpleLogger::SetPrefixList({DateTimePrefix});
+
+LOG(DEBUG) << L"Pi = " << std::numbers::pi;
 ```
+
+`SetOstream` is shorthand for installing an `OStreamSink`:
+
+```cpp
+SimpleLogger::SetSink(std::make_shared<OStreamSink>(std::move(out_stream)));
+```
+
+## Writing a sink
+
+Derive from `Sink` and implement two `noexcept` functions:
+
+```cpp
+class MySink final : public Sink {
+ public:
+  bool Write(std::wstring_view line) noexcept override;  // One record, no terminator.
+  bool Flush() noexcept override;
+};
+```
+
+- `Write` may be called concurrently from any thread; each sink chooses its own strategy (lock, queue, none).
+- `line` has no terminator. The sink owns the framing (newline, datagram boundary and so on).
+- Both functions report failure by returning `false`. The logger ignores the result, so the policy for a failing destination (drop, retry, reconnect) belongs to the sink.
 
 ## Expected output
 
-```text
-DfsR (preorder):  [1, 2, 3, 4, 5]
-DfsR (postorder): [3, 2, 5, 4, 1]
-Dfs (preorder):   [1, 2, 3, 4, 5]
-Dfs (postorder):  [3, 2, 5, 4, 1]
-Bfs:              [1, 2, 4, 3, 5]
-```
+Each line is the prefixes, the severity, then the message. `LOG()` with no argument defaults to `DEBUG`. Timestamps vary per run:
 
-The recursive and iterative DFS variants produce identical results for the same traversal order.
+```text
+2026-10-24T09:15:42Z DEBUG: 10
+2026-10-24T09:15:42Z DEBUG: Line 1
+2026-10-24T09:15:42Z DEBUG: Line 2
+2026-10-24T09:15:42Z DEBUG: Pi = 3.14159
+2026-10-24T09:15:42Z DEBUG: Line End
+```
 
 ## Notes
 
-- Iterative postorder pushes children left then right and prepends each visited node to the output. The final list is the reverse of a root-right-left walk, yielding left-right-root order.
-- Preorder and postorder describe DFS visit order. BFS is level order and has no preorder/postorder equivalent.
-- All traversals take O(n) time, where n is the number of nodes.
-- Auxiliary space depends on the tree shape and traversal: recursive DFS uses O(h) call-stack space, iterative preorder uses O(h), iterative postorder may use O(n), and BFS uses O(w), where h is the tree height and w is the maximum tree width.
+- Each `LOG(...)` statement creates a temporary that buffers the whole line in a local `std::wostringstream`. Formatting touches no shared state and never blocks on I/O. The finished line is handed to the sink in a single `Write()` call when the temporary is destroyed, so lines from concurrent threads do not interleave (`OStreamSink` writes the line and its newline under one lock).
+- Logging takes a shared lock, while `SetSink`, `SetOstream` and `SetPrefixList` take an exclusive lock. Concurrent logging does not serialize on the configuration lock, and reconfiguring never races with a log line being built.
+- Each log line pins the sink that was active when it was created, so replacing the sink while other threads are logging is safe: in-flight lines finish on the old sink. The previous sink is released after the configuration lock is dropped, so a slow sink destructor cannot stall new log lines.
+- Logging never throws into the caller. Failures inside the logger are reported to `stderr`, and if no sink is set (or `SetSink(nullptr)` was called), log statements are silently dropped.
+- The prefix list is passed by value, so the copy happens at the call site and the locked section only moves the vector.
+- `OStreamSink` serializes only the writers that go through it. Anything else writing to the same stream bypasses its lock.
+- The severity macros are short and unprefixed, so they can collide with other headers (for example, `ERROR` in the Windows headers).
+- The logger is wide-character based: lines are `std::wstring_view` and string literals are written as `L"..."`. Converting to another encoding (for example UTF-8 for files or sockets) is the job of the sink.
 
 ## Requirements
 
-A C++23-compatible compiler and standard library. On Linux, GCC 16 or later.
+A C++23-compatible compiler and standard library.
 
 ## Build and Run
 
@@ -62,5 +91,5 @@ MIT License. Copyright © 2024-2026 Amit Gefen.
 
 ---
 
-**Last Updated:** 2026-10-22  
+**Last Updated:** 2026-10-24  
 **Maintainer:** AmitGDev
